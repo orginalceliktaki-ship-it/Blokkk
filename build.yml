@@ -44,12 +44,25 @@ jobs:
                   applicationId = "com.blok.yardimci"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 5
+                  versionName = "5"
+              }
+
+              signingConfigs {
+                  create("fixed") {
+                      storeFile = file("debug.keystore")
+                      storeType = "pkcs12"
+                      storePassword = "blokyardimci"
+                      keyAlias = "blok"
+                      keyPassword = "blokyardimci"
+                  }
               }
 
               buildTypes {
-                  release {
+                  getByName("debug") {
+                      signingConfig = signingConfigs.getByName("fixed")
+                  }
+                  getByName("release") {
                       isMinifyEnabled = false
                   }
               }
@@ -565,7 +578,7 @@ jobs:
                       "3. Alttaki 3 parçanın nereye konacağı numaralı renkli çerçevelerle tahtanın üstünde görünür. " +
                       "Parçanın altındaki numara oynama sırasıdır.\n" +
                       "4. Hamle yapınca öneri kendiliğinden yenilenir.\n\n" +
-                      "Durdurmak için bildirimdeki Durdur'a bas."
+                      "Durdurmak için bildirimdeki Durdur'a bas.\n\nSürüm 5"
                   info.textSize = 16f
                   info.setTextColor(0xFF9A96C9.toInt())
                   info.setPadding(0, pad, 0, pad)
@@ -861,6 +874,53 @@ jobs:
           rootProject.name = "BlokYardimcisi"
           include(":app")
           BLOK_EOF
+          base64 -d > app/debug.keystore <<'BLOK_B64'
+          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
+          BLOK_B64
 
       - name: Derle
         run: gradle assembleDebug --no-daemon --stacktrace
