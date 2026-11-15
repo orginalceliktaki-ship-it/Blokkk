@@ -240,55 +240,63 @@ jobs:
                   return qCount >= 58
               }
 
-              private fun readPiece(i: Int): Piece? {
-                  val x0 = ((85 + 315 * i + dx) * s).roundToInt()
-                  val x1 = (x0 + 283 * s).roundToInt()
-                  val y0 = ((CY0 + dy + 950) * s).roundToInt()
-                  val y1 = ((CY0 + dy + 1160) * s).roundToInt()
-                  var a = Int.MAX_VALUE
-                  var b = Int.MAX_VALUE
-                  var c = -1
-                  var d = -1
-                  var y = y0
-                  while (y < y1) {
-                      var x = x0
-                      while (x < x1) {
-                          if (bright(x, y)) {
-                              if (x < a) a = x
-                              if (y < b) b = y
-                              if (x > c) c = x
-                              if (y > d) d = y
-                          }
-                          x += 2
+              /** [start, end] aralıklarını döner: eşiği geçen ardışık bölgeler, kısa boşluklar birleştirilir, kısa bölgeler atılır. */
+              private fun segments(v: IntArray, thr: Int, gapMin: Int, lenMin: Int): List<IntArray> {
+                  val out = ArrayList<IntArray>()
+                  var st = -1
+                  var last = -1
+                  for (k in v.indices) {
+                      if (v[k] >= thr) {
+                          if (st < 0) st = k
+                          last = k
+                      } else if (st >= 0 && k - last >= gapMin) {
+                          out.add(intArrayOf(st, last))
+                          st = -1
                       }
-                      y += 2
                   }
-                  if (c < 0) return null
-                  val gap = 10 * s
-                  val yy = (b + 22 * s).roundToInt()
-                  var xx = a
-                  while (xx <= c && !bright(xx, yy)) xx++
-                  var run = 0
-                  while (bright(xx + run, yy) && run < 400) run++
-                  val t0 = max(40 * s, run + gap)
-                  val n = ((c - a + gap) / t0).roundToInt().coerceIn(1, 5)
-                  val m = ((d - b + gap) / t0).roundToInt().coerceIn(1, 5)
-                  val tx = (c - a + gap) / n
-                  val ty = (d - b + gap) / m
-                  val rows = IntArray(m)
+                  if (st >= 0) out.add(intArrayOf(st, last))
+                  return out.filter { it[1] - it[0] + 1 >= lenMin }
+              }
+
+              /**
+               * Tepsideki bir parçayı okur. Hücre boyutunu tahmin etmez: parlak piksellerin
+               * sütun ve satır izdüşümlerindeki boşluklardan hücre sınırlarını bulur.
+               */
+              private fun readPiece(i: Int): Piece? {
+                  val x0 = ((85 + 315 * i + dx) * s).roundToInt().coerceAtLeast(0)
+                  val x1 = min(f.w, (x0 + 283 * s).roundToInt())
+                  val y0 = ((CY0 + dy + 950) * s).roundToInt().coerceAtLeast(0)
+                  val y1 = min(f.h, ((CY0 + dy + 1152) * s).roundToInt())
+                  if (x1 - x0 < 20 || y1 - y0 < 20) return null
+                  val colCnt = IntArray(x1 - x0)
+                  val rowCnt = IntArray(y1 - y0)
+                  for (y in y0 until y1) {
+                      for (x in x0 until x1) {
+                          if (bright(x, y)) {
+                              colCnt[x - x0]++
+                              rowCnt[y - y0]++
+                          }
+                      }
+                  }
+                  val gapMin = max(2, (5 * s).roundToInt())
+                  val lenMin = max(8, (20 * s).roundToInt())
+                  val cs = segments(colCnt, max(3, (6 * s).roundToInt()), gapMin, lenMin)
+                  val rs = segments(rowCnt, lenMin, gapMin, lenMin)
+                  if (cs.isEmpty() || rs.isEmpty() || cs.size > 5 || rs.size > 5) return null
+                  val rows = IntArray(rs.size)
                   var any = false
-                  for (r in 0 until m) {
-                      for (q in 0 until n) {
-                          val px = a + tx * q + (tx - gap) / 2
-                          val py = b + ty * r + (ty - gap) / 2
-                          if (filled(avg(px, py, max(2, (5 * s).roundToInt())))) {
-                              rows[r] = rows[r] or (1 shl q)
+                  for (ri in rs.indices) {
+                      for (ci in cs.indices) {
+                          val cxp = x0 + (cs[ci][0] + cs[ci][1]) / 2.0
+                          val cyp = y0 + (rs[ri][0] + rs[ri][1]) / 2.0
+                          if (filled(avg(cxp, cyp, max(2, (5 * s).roundToInt())))) {
+                              rows[ri] = rows[ri] or (1 shl ci)
                               any = true
                           }
                       }
                   }
                   if (!any) return null
-                  return Piece(i, m, n, rows)
+                  return Piece(i, rs.size, cs.size, rows)
               }
 
               fun analyze(frame: Frame): Reading? {
