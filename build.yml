@@ -44,8 +44,8 @@ jobs:
                   applicationId = "com.blok.yardimci"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 5
-                  versionName = "5"
+                  versionCode = 6
+                  versionName = "6"
               }
 
               signingConfigs {
@@ -111,6 +111,7 @@ jobs:
           package com.blok.yardimci
 
           import java.nio.ByteBuffer
+          import kotlin.math.abs
           import kotlin.math.max
           import kotlin.math.min
           import kotlin.math.roundToInt
@@ -125,23 +126,47 @@ jobs:
               fun r(x: Int, y: Int): Int = buf.get(y * rs + x * ps).toInt() and 0xFF
               fun g(x: Int, y: Int): Int = buf.get(y * rs + x * ps + 1).toInt() and 0xFF
               fun b(x: Int, y: Int): Int = buf.get(y * rs + x * ps + 2).toInt() and 0xFF
+
+              /** Pikselin en parlak kanalı. */
+              fun m(x: Int, y: Int): Int {
+                  val o = y * rs + x * ps
+                  val rr = buf.get(o).toInt() and 0xFF
+                  val gg = buf.get(o + 1).toInt() and 0xFF
+                  val bb = buf.get(o + 2).toInt() and 0xFF
+                  return max(rr, max(gg, bb))
+              }
           }
 
           /**
            * Ekran görüntüsünden 8x8 tahtayı ve alttaki 3 parçayı okur.
            * Koordinatlar 1080 piksel genişlikteki referans yerleşime göredir, ekrana oranlanır.
+           *
+           * Sürüm 6 değişiklikleri:
+           *  - Izgara hizası artık hücreler arasındaki koyu boşlukların gerçek konumundan ölçülür
+           *    (alt piksel doğruluğu, tahta boşken de çalışır, her karede kendini düzeltir).
+           *  - Parçalar parlaklık eşiğine ve satır/sütun izdüşümüne bağlı değil, tek tek karo
+           *    (bağlı bileşen) olarak okunur: soluk renkler, yazılar ve animasyon artıkları parçayı bozmaz.
            */
           class Analyzer {
               companion object {
                   const val P = 118.6
                   const val CX0 = 125.0
                   const val CY0 = 975.0
+
+                  // Boşluk vadisinin ölçülen merkezi ile gerçek ızgara çizgisi arasındaki sabit sapma (1080 px genişlikte).
+                  private const val BX = 0.4
+                  private const val BY = 3.5
+
+                  // Tepsi arka planı en fazla ~115 parlaklıkta, en soluk karo bile 145'in üstünde.
+                  private const val TILE_MIN = 128
+                  private const val MIN_DEPTH = 30.0
               }
 
               var dx = 0.0
               var dy = 0.0
               var s = 1.0
-              private var qCount = 0
+              private var aligned = false
+              private var nextFitAt = 0L
               private lateinit var f: Frame
               private val tmp = IntArray(3)
 
@@ -181,20 +206,9 @@ jobs:
                   return m / 255.0 > 0.58 && (m - n).toDouble() / m > 0.3
               }
 
-              private fun bright(x: Int, y: Int): Boolean {
-                  if (x < 0 || y < 0 || x >= f.w || y >= f.h) return false
-                  val r = f.r(x, y)
-                  val g = f.g(x, y)
-                  val b = f.b(x, y)
-                  val m = max(r, max(g, b))
-                  val n = min(r, min(g, b))
-                  return m > 153 && (m - n).toDouble() / m > 0.4
-              }
-
-              /** Izgara doğru hizalıysa yüksek değer verir; qCount = belirgin hücre sayısı (64 üzerinden). */
+              /** Kaba hizalama için: hücre merkezi ile hücre arası boşluk arasındaki zıtlık toplamı. */
               private fun quality(): Double {
                   var sum = 0.0
-                  var cnt = 0
                   val half = P * s / 2
                   for (r in 0..7) {
                       for (c in 0..7) {
@@ -204,15 +218,14 @@ jobs:
                           val gv = mx(avg(x, if (r < 7) y + half else y - half, 1))
                           val gh = mx(avg(if (c < 7) x + half else x - half, y, 1))
                           val d = m - max(gv, gh)
-                          if (d > 25) cnt++
                           sum += d.coerceIn(-30, 60)
                       }
                   }
-                  qCount = cnt
                   return sum
               }
 
-              private fun fit(): Boolean {
+              /** Kaba arama: 6 px adımlarla tarar, sonuç ince hizalamaya başlangıç olur. */
+              private fun coarseFit() {
                   var bx = 0.0
                   var by = 0.0
                   var bs = -1e18
@@ -232,93 +245,232 @@ jobs:
                       }
                       a += 6
                   }
-                  val cx0 = bx
-                  val cy0 = by
-                  bs = -1e18
-                  for (a2 in -5..5) {
-                      for (b2 in -5..5) {
-                          dx = cx0 + a2
-                          dy = cy0 + b2
-                          val q = quality()
-                          if (q > bs) {
-                              bs = q
-                              bx = dx
-                              by = dy
-                          }
-                      }
-                  }
                   dx = bx
                   dy = by
-                  quality()
-                  return qCount >= 58
               }
 
-              /** [start, end] aralıklarını döner: eşiği geçen ardışık bölgeler, kısa boşluklar birleştirilir, kısa bölgeler atılır. */
-              private fun segments(v: IntArray, thr: Int, gapMin: Int, lenMin: Int): List<IntArray> {
-                  val out = ArrayList<IntArray>()
-                  var st = -1
-                  var last = -1
-                  for (k in v.indices) {
-                      if (v[k] >= thr) {
-                          if (st < 0) st = k
-                          last = k
-                      } else if (st >= 0 && k - last >= gapMin) {
-                          out.add(intArrayOf(st, last))
-                          st = -1
+              private fun median(a: DoubleArray): Double {
+                  val b = a.sortedArray()
+                  return b[b.size / 2]
+              }
+
+              /** Boşluk çizgisinin koyu vadisinin merkezi (dizi indeksi) ve derinliği. */
+              private fun valley(seg: DoubleArray): DoubleArray? {
+                  var hi = -1e18
+                  var lo = 1e18
+                  for (v in seg) {
+                      if (v > hi) hi = v
+                      if (v < lo) lo = v
+                  }
+                  var sw = 0.0
+                  var sp = 0.0
+                  for (i in seg.indices) {
+                      val w = hi - seg[i] - 0.5 * (hi - lo)
+                      if (w > 0.0) {
+                          sw += w
+                          sp += w * i
                       }
                   }
-                  if (st >= 0) out.add(intArrayOf(st, last))
-                  return out.filter { it[1] - it[0] + 1 >= lenMin }
+                  if (sw <= 0.0) return null
+                  return doubleArrayOf(sp / sw, hi - lo)
               }
 
               /**
-               * Tepsideki bir parçayı okur. Hücre boyutunu tahmin etmez: parlak piksellerin
-               * sütun ve satır izdüşümlerindeki boşluklardan hücre sınırlarını bulur.
+               * Hücreler arasındaki 7 dikey ve 7 yatay koyu boşluğun gerçek konumunu ölçer.
+               * Dönüş: [xSapma, ySapma (piksel), xDerinlik, yDerinlik] ya da ölçülemezse null.
+               */
+              private fun gapOffsets(): DoubleArray? {
+                  val y0 = max(0, ((CY0 + dy - 45) * s).toInt())
+                  val y1 = min(f.h - 1, ((CY0 + dy + 7 * P + 45) * s).toInt())
+                  val x0 = max(0, ((CX0 + dx - 45) * s).toInt())
+                  val x1 = min(f.w - 1, ((CX0 + dx + 7 * P + 45) * s).toInt())
+                  if (y1 - y0 < 100 || x1 - x0 < 100) return null
+                  val ox = DoubleArray(7)
+                  val oy = DoubleArray(7)
+                  val ex = DoubleArray(7)
+                  val ey = DoubleArray(7)
+                  for (c in 0..6) {
+                      val g = (CX0 + dx + P * c + P / 2) * s
+                      val lo = (g - 14 * s).toInt()
+                      val hi = (g + 15 * s).toInt()
+                      if (lo < 0 || hi >= f.w || hi - lo < 4) return null
+                      val seg = DoubleArray(hi - lo)
+                      for (i in seg.indices) {
+                          var sum = 0L
+                          var cnt = 0
+                          var y = y0
+                          while (y <= y1) {
+                              sum += f.m(lo + i, y)
+                              cnt++
+                              y += 4
+                          }
+                          seg[i] = sum.toDouble() / cnt
+                      }
+                      val v = valley(seg) ?: return null
+                      ox[c] = lo + v[0] - g
+                      ex[c] = v[1]
+                  }
+                  for (r in 0..6) {
+                      val g = (CY0 + dy + P * r + P / 2) * s
+                      val lo = (g - 14 * s).toInt()
+                      val hi = (g + 15 * s).toInt()
+                      if (lo < 0 || hi >= f.h || hi - lo < 4) return null
+                      val seg = DoubleArray(hi - lo)
+                      for (i in seg.indices) {
+                          var sum = 0L
+                          var cnt = 0
+                          var x = x0
+                          while (x <= x1) {
+                              sum += f.m(x, lo + i)
+                              cnt++
+                              x += 4
+                          }
+                          seg[i] = sum.toDouble() / cnt
+                      }
+                      val v = valley(seg) ?: return null
+                      oy[r] = lo + v[0] - g
+                      ey[r] = v[1]
+                  }
+                  return doubleArrayOf(median(ox), median(oy), median(ex), median(ey))
+              }
+
+              /** İnce hizalama: boşlukların ölçülen konumuna doğru birkaç adımda yakınsar. */
+              private fun refine(): Boolean {
+                  for (k in 0 until 4) {
+                      val g = gapOffsets() ?: return false
+                      val ex = g[0] / s - BX
+                      val ey = g[1] / s - BY
+                      dx += ex
+                      dy += ey
+                      if (abs(ex) < 0.4 && abs(ey) < 0.4) break
+                  }
+                  val g = gapOffsets() ?: return false
+                  return g[2] >= MIN_DEPTH && g[3] >= MIN_DEPTH
+              }
+
+              private fun ensureAligned(): Boolean {
+                  if (aligned) {
+                      val g = gapOffsets()
+                      if (g != null && g[2] >= MIN_DEPTH && g[3] >= MIN_DEPTH) {
+                          val ex = g[0] / s - BX
+                          val ey = g[1] / s - BY
+                          if (abs(ex) <= 1.0 && abs(ey) <= 1.0) return true
+                          if (refine()) return true
+                      }
+                      aligned = false
+                  }
+                  val now = System.currentTimeMillis()
+                  if (now < nextFitAt) return false
+                  coarseFit()
+                  if (refine()) {
+                      aligned = true
+                      return true
+                  }
+                  // Oyun ekranı değil: pahalı aramayı sürekli tekrarlama.
+                  nextFitAt = now + 1500
+                  return false
+              }
+
+              /**
+               * Tepsideki bir parçayı okur. Parlak (karo) piksellerden bağlı bileşenler çıkarır; her karo bir
+               * bileşendir. Karo merkezlerinden satır/sütun indeksi hesaplanır, hücre boyutu karo genişliğinden bulunur.
+               * Küçük bileşenler (yazı, parıltı, animasyon artığı) karo sayılmaz.
                */
               private fun readPiece(i: Int): Piece? {
                   val x0 = ((85 + 315 * i + dx) * s).roundToInt().coerceAtLeast(0)
                   val x1 = min(f.w, (x0 + 283 * s).roundToInt())
                   val y0 = ((CY0 + dy + 950) * s).roundToInt().coerceAtLeast(0)
-                  val y1 = min(f.h, ((CY0 + dy + 1152) * s).roundToInt())
+                  val y1 = min(f.h, ((CY0 + dy + 1146) * s).roundToInt())
                   if (x1 - x0 < 20 || y1 - y0 < 20) return null
-                  val colCnt = IntArray(x1 - x0)
-                  val rowCnt = IntArray(y1 - y0)
-                  for (y in y0 until y1) {
-                      for (x in x0 until x1) {
-                          if (bright(x, y)) {
-                              colCnt[x - x0]++
-                              rowCnt[y - y0]++
-                          }
+
+                  val step = 2
+                  val gw = (x1 - x0 + step - 1) / step
+                  val gh = (y1 - y0 + step - 1) / step
+                  val mask = BooleanArray(gw * gh)
+                  for (gy in 0 until gh) {
+                      for (gx in 0 until gw) {
+                          mask[gy * gw + gx] = f.m(x0 + gx * step, y0 + gy * step) >= TILE_MIN
                       }
                   }
-                  val gapMin = max(2, (5 * s).roundToInt())
-                  val lenMin = max(8, (20 * s).roundToInt())
-                  val cs = segments(colCnt, max(3, (6 * s).roundToInt()), gapMin, lenMin)
-                  val rs = segments(rowCnt, lenMin, gapMin, lenMin)
-                  if (cs.isEmpty() || rs.isEmpty() || cs.size > 5 || rs.size > 5) return null
-                  val rows = IntArray(rs.size)
-                  var any = false
-                  for (ri in rs.indices) {
-                      for (ci in cs.indices) {
-                          val cxp = x0 + (cs[ci][0] + cs[ci][1]) / 2.0
-                          val cyp = y0 + (rs[ri][0] + rs[ri][1]) / 2.0
-                          if (filled(avg(cxp, cyp, max(2, (5 * s).roundToInt())))) {
-                              rows[ri] = rows[ri] or (1 shl ci)
-                              any = true
+
+                  val seen = BooleanArray(gw * gh)
+                  val queue = IntArray(gw * gh)
+                  val minSide = max(4, (28 * s / step).roundToInt())
+                  val maxSide = (92 * s / step).roundToInt()
+                  val minArea = max(20, (450 * s * s / (step * step)).roundToInt())
+                  val tcx = ArrayList<Double>()
+                  val tcy = ArrayList<Double>()
+                  val tw = ArrayList<Double>()
+
+                  for (start in 0 until gw * gh) {
+                      if (!mask[start] || seen[start]) continue
+                      var head = 0
+                      var tail = 0
+                      queue[tail++] = start
+                      seen[start] = true
+                      var minX = gw
+                      var maxX = -1
+                      var minY = gh
+                      var maxY = -1
+                      var area = 0
+                      while (head < tail) {
+                          val cur = queue[head++]
+                          val py = cur / gw
+                          val px = cur % gw
+                          area++
+                          if (px < minX) minX = px
+                          if (px > maxX) maxX = px
+                          if (py < minY) minY = py
+                          if (py > maxY) maxY = py
+                          for (ny in max(0, py - 1)..min(gh - 1, py + 1)) {
+                              for (nx in max(0, px - 1)..min(gw - 1, px + 1)) {
+                                  val k = ny * gw + nx
+                                  if (mask[k] && !seen[k]) {
+                                      seen[k] = true
+                                      queue[tail++] = k
+                                  }
+                              }
                           }
                       }
+                      val bw = maxX - minX + 1
+                      val bh = maxY - minY + 1
+                      if (area < minArea || bw < minSide || bh < minSide || bw > maxSide || bh > maxSide) continue
+                      tcx.add((minX + maxX) / 2.0 * step)
+                      tcy.add((minY + maxY) / 2.0 * step)
+                      tw.add(bw.toDouble() * step)
                   }
-                  if (!any) return null
-                  return Piece(i, rs.size, cs.size, rows)
+                  if (tcx.isEmpty()) return null
+
+                  val sortedW = tw.sorted()
+                  val pitch = sortedW[sortedW.size / 2] / 0.86
+                  var minx = 1e18
+                  var maxx = -1e18
+                  var miny = 1e18
+                  var maxy = -1e18
+                  for (k in tcx.indices) {
+                      if (tcx[k] < minx) minx = tcx[k]
+                      if (tcx[k] > maxx) maxx = tcx[k]
+                      if (tcy[k] < miny) miny = tcy[k]
+                      if (tcy[k] > maxy) maxy = tcy[k]
+                  }
+                  val n = ((maxx - minx) / pitch).roundToInt() + 1
+                  val m = ((maxy - miny) / pitch).roundToInt() + 1
+                  if (n > 5 || m > 5) return null
+                  val pxs = if (n > 1) (maxx - minx) / (n - 1) else pitch
+                  val pys = if (m > 1) (maxy - miny) / (m - 1) else pitch
+                  val rows = IntArray(m)
+                  for (k in tcx.indices) {
+                      val ci = if (n > 1) ((tcx[k] - minx) / pxs).roundToInt() else 0
+                      val ri = if (m > 1) ((tcy[k] - miny) / pys).roundToInt() else 0
+                      rows[ri] = rows[ri] or (1 shl ci)
+                  }
+                  return Piece(i, m, n, rows)
               }
 
               fun analyze(frame: Frame): Reading? {
                   f = frame
                   s = frame.w / 1080.0
-                  quality()
-                  if (qCount < 60) {
-                      if (!fit()) return null
-                  }
+                  if (!ensureAligned()) return null
                   val board = IntArray(8)
                   val rad = (8 * s).roundToInt()
                   for (r in 0..7) {
@@ -376,8 +528,18 @@ jobs:
 
               private var running = false
               private var shownSig = ""
-              private var pendingSig = ""
               private var shownEmpty = true
+              private var shownMoves: List<Move> = emptyList()
+              private var shownDx = 0.0
+              private var shownDy = 0.0
+          
+              // Son okunan kare ve ne zamandır değişmediği (ekran durağansa yeni kare gelmez, bu yüzden zamanla ölçülür)
+              private var curSig = ""
+              private var curReading: Reading? = null
+              private var curSince = 0L
+              private var nullSince = 0L
+
+              private val STABLE_MS = 450L
 
               private val tick = object : Runnable {
                   override fun run() {
@@ -387,7 +549,7 @@ jobs:
                       } catch (e: Throwable) {
                           // Tek kare hatası servisi durdurmasın
                       }
-                      handler.postDelayed(this, 300)
+                      handler.postDelayed(this, 200)
                   }
               }
 
@@ -462,38 +624,68 @@ jobs:
               }
 
               private fun step() {
+                  val now = System.currentTimeMillis()
                   val r = reader ?: return
-                  val img = r.acquireLatestImage() ?: return
-                  try {
-                      val plane = img.planes[0]
-                      val frame = Frame(plane.buffer, plane.rowStride, plane.pixelStride, img.width, img.height)
-                      val rd = analyzer.analyze(frame)
-                      if (rd == null) {
-                          pendingSig = ""
-                          shownSig = ""
-                          if (!shownEmpty) {
-                              shownEmpty = true
-                              ui.post { overlay?.update(emptyList(), 0.0, 0.0, 1.0) }
+                  val img = r.acquireLatestImage()
+                  if (img != null) {
+                      try {
+                          val plane = img.planes[0]
+                          val frame = Frame(plane.buffer, plane.rowStride, plane.pixelStride, img.width, img.height)
+                          val rd = analyzer.analyze(frame)
+                          if (rd == null) {
+                              curReading = null
+                              curSig = ""
+                              if (nullSince == 0L) nullSince = now
+                          } else {
+                              nullSince = 0L
+                              val sig = rd.board.joinToString(",") + "|" +
+                                  rd.pieces.joinToString(";") { it.idx.toString() + ":" + it.h + "x" + it.w + ":" + it.rows.joinToString(",") }
+                              if (sig != curSig) {
+                                  curSig = sig
+                                  curReading = rd
+                                  curSince = now
+                              }
                           }
-                          return
+                      } finally {
+                          img.close()
                       }
-                      val sig = rd.board.joinToString(",") + "|" +
-                          rd.pieces.joinToString(";") { it.idx.toString() + ":" + it.h + "x" + it.w + ":" + it.rows.joinToString(",") }
-                      if (sig == shownSig) return
-                      if (sig != pendingSig) {
-                          pendingSig = sig
-                          return
+                  }
+
+                  // Ekran durağan kalınca VirtualDisplay yeni kare üretmez. Bu yüzden "iki kare aynı" şartı yerine
+                  // "son okuma yeterince uzun süredir değişmedi" şartı aranır: animasyon bitince öneri mutlaka tazelenir.
+                  val rd = curReading
+                  if (rd == null) {
+                      if (nullSince != 0L && now - nullSince >= 800 && !shownEmpty) {
+                          shownEmpty = true
+                          shownSig = ""
+                          shownMoves = emptyList()
+                          ui.post { overlay?.update(emptyList(), 0.0, 0.0, 1.0) }
                       }
-                      // Aynı görüntü iki kare üst üste okundu: animasyon bitti, çöz.
-                      shownSig = sig
+                      return
+                  }
+                  if (curSig != shownSig) {
+                      if (now - curSince < STABLE_MS) return
+                      shownSig = curSig
                       val moves = if (rd.pieces.isEmpty()) emptyList() else Solver.solve(rd.board, rd.pieces)
                       val dx = analyzer.dx
                       val dy = analyzer.dy
                       val s = analyzer.s
+                      shownMoves = moves
+                      shownDx = dx
+                      shownDy = dy
                       shownEmpty = moves.isEmpty()
                       ui.post { overlay?.update(moves, dx, dy, s) }
-                  } finally {
-                      img.close()
+                  } else if (shownMoves.isNotEmpty() &&
+                      (Math.abs(analyzer.dx - shownDx) > 1.5 || Math.abs(analyzer.dy - shownDy) > 1.5)
+                  ) {
+                      // Aynı durum ama ızgara kaydı (ekran sarsıntısı vb.): öneriyi yeni konuma taşı.
+                      val moves = shownMoves
+                      val dx = analyzer.dx
+                      val dy = analyzer.dy
+                      val s = analyzer.s
+                      shownDx = dx
+                      shownDy = dy
+                      ui.post { overlay?.update(moves, dx, dy, s) }
                   }
               }
 
@@ -578,7 +770,7 @@ jobs:
                       "3. Alttaki 3 parçanın nereye konacağı numaralı renkli çerçevelerle tahtanın üstünde görünür. " +
                       "Parçanın altındaki numara oynama sırasıdır.\n" +
                       "4. Hamle yapınca öneri kendiliğinden yenilenir.\n\n" +
-                      "Durdurmak için bildirimdeki Durdur'a bas.\n\nSürüm 5"
+                      "Durdurmak için bildirimdeki Durdur'a bas.\n\nSürüm 6"
                   info.textSize = 16f
                   info.setTextColor(0xFF9A96C9.toInt())
                   info.setPadding(0, pad, 0, pad)
